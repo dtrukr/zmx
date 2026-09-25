@@ -64,7 +64,9 @@ jobs:
       - name: Integration tests
         run: |
           zig build
-          PATH="$PWD/zig-out/bin:$PATH" bats --jobs 1 test/*.bats
+          # Upstream runs these in `docker run -t`; they assume a controlling
+          # tty (zmx opens /dev/tty for the window size), which runners lack.
+          PATH="$PWD/zig-out/bin:$PATH" script -qec "bats --jobs 1 test/*.bats" /dev/null
 
       - name: Push merged main
         if: steps.sync.outputs.merged == 'true'
