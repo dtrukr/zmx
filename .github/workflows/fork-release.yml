@@ -1,0 +1,111 @@
+# dtrukr/zmx fork: upstream neurosnap/zmx main + local patches.
+#
+# Daily (and on every push to main) this merges upstream main, runs the unit
+# and integration tests, and publishes a GitHub release when main moved since
+# the last one. A merge conflict or a failing test stops the run before
+# anything is pushed or published, so hosts keep the previous release.
+#
+# Assets per release: upstream-style `zmx-<version>-<os>-<arch>.tar.gz` (+ .sha256)
+# and version-less copies (`zmx-macos-aarch64.tar.gz`, ...) so installers can
+# use https://github.com/dtrukr/zmx/releases/latest/download/<asset>.
+name: fork-release
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  sync-test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: sync
+        run: |
+          git config user.name "zmx-fork-bot"
+          git config user.email "zmx-fork-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/neurosnap/zmx.git
+          git fetch --no-tags upstream main
+          before=$(git rev-parse HEAD)
+          git merge --no-edit upstream/main
+          echo "merged=$([ "$before" != "$(git rev-parse HEAD)" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Install zig and bats
+        run: |
+          curl -sSfL --retry 3 -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          sudo apt-get update -qq && sudo apt-get install -y -qq bats
+
+      - name: Format check
+        run: zig fmt --check .
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Integration tests
+        run: |
+          zig build
+          PATH="$PWD/zig-out/bin:$PATH" bats --jobs 1 test/*.bats
+
+      - name: Push merged main
+        if: steps.sync.outputs.merged == 'true'
+        run: git push origin HEAD:main
+
+      - name: Decide release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse --short=7 HEAD)
+          base=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
+          tag="v${base}-fork.${sha}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${base}-fork.${sha}" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release binaries
+        if: steps.rel.outputs.publish == 'true'
+        run: |
+          zig build release -Dversion="${{ steps.rel.outputs.version }}"
+          cd zig-out/dist
+          for f in zmx-*.tar.gz; do
+            plain=$(echo "$f" | sed "s/^zmx-${{ steps.rel.outputs.version }}-/zmx-/")
+            cp "$f" "$plain"
+            shasum -a 256 "$plain" > "$plain.sha256"
+          done
+          ls -la
+
+      - name: Publish release
+        if: steps.rel.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag "${{ steps.rel.outputs.tag }}"
+          git push origin "${{ steps.rel.outputs.tag }}"
+          gh release create "${{ steps.rel.outputs.tag }}" zig-out/dist/* \
+            --repo "$GITHUB_REPOSITORY" --latest \
+            --title "zmx ${{ steps.rel.outputs.version }}" \
+            --notes "upstream neurosnap/zmx main + dtrukr patches at $(git rev-parse HEAD)"
