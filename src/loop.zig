@@ -547,7 +547,9 @@ pub const Client = struct {
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
     /// Parser state of this client's input stream, carried across reads so a
     /// terminal reply split between two reads is still recognised as one.
-    input_parser: ghostty_vt.Parser = ghostty_vt.Parser.init(),
+    /// Created on first input: `Parser.init()` cannot run at comptime (it
+    /// asks valgrind on Linux), so it cannot be a field default.
+    input_parser: ?ghostty_vt.Parser = null,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
@@ -900,7 +902,8 @@ pub const Daemon = struct {
 
         // Every read goes through the client's parser, the leader's too, so
         // its state stays true to the stream if this client stops leading.
-        const user_input = util.isUserInputContinuing(&client.input_parser, payload);
+        if (client.input_parser == null) client.input_parser = ghostty_vt.Parser.init();
+        const user_input = util.isUserInputContinuing(&client.input_parser.?, payload);
 
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
