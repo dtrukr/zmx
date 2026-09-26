@@ -545,6 +545,9 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
+    /// Parser state of this client's input stream, carried across reads so a
+    /// terminal reply split between two reads is still recognised as one.
+    input_parser: ghostty_vt.Parser = ghostty_vt.Parser.init(),
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
@@ -895,6 +898,10 @@ pub const Daemon = struct {
         // NOTE: for local dev only
         // std.log.debug("buffering pty input data={x}", .{payload});
 
+        // Every read goes through the client's parser, the leader's too, so
+        // its state stays true to the stream if this client stops leading.
+        const user_input = util.isUserInputContinuing(&client.input_parser, payload);
+
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
             self.queuePtyInput(gpa, payload);
@@ -902,7 +909,7 @@ pub const Daemon = struct {
         }
 
         // check if leader needs to be updated by detecting any user input
-        if (util.isUserInput(payload)) {
+        if (user_input) {
             try self.setLeader(gpa, client);
             self.queuePtyInput(gpa, payload);
         }

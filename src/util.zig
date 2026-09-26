@@ -702,11 +702,28 @@ fn hasPrivateMarker(csi: ghostty_vt.Parser.Action.CSI) bool {
 /// would otherwise make it leader and resize the session to its window.
 pub fn isUserInput(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
+    return isUserInputContinuing(&parser, payload);
+}
+
+/// `isUserInput` for one read of a client's input stream, continuing from
+/// the parser state its earlier reads left behind.
+///
+/// A client's bytes arrive in arbitrary chunks (ssh packets, pipe reads), so a
+/// terminal reply can be split: `ESC [ ?` in one read and `62;22;52c` in the
+/// next. Judged on their own, the tail is plain printable text: it made a
+/// passive viewer the leader and was forwarded to the app as typing (a stray
+/// `62;22;52c` in Codex's input box). With the parser carried across reads,
+/// the tail is recognised as the rest of the sequence.
+///
+/// The whole payload is always fed through the parser, so the state stays
+/// true to the stream; the first decisive event in the payload wins.
+pub fn isUserInputContinuing(parser: *ghostty_vt.Parser, payload: []const u8) bool {
+    var decided: ?bool = null;
     var i: usize = 0;
     while (i < payload.len) {
-        if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+        if (parser.state == .ground and payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
             if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
-                if (kitty.event_type != 3) return true;
+                if (decided == null and kitty.event_type != 3) decided = true;
                 i += 2 + kitty.consumed;
                 continue;
             }
@@ -715,8 +732,9 @@ pub fn isUserInput(payload: []const u8) bool {
         const actions = parser.next(payload[i]);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
+            if (decided != null) continue;
             switch (action) {
-                .print => return true, // printable characters
+                .print => decided = true, // printable characters
                 .csi_dispatch => |csi| {
                     // A reply, not a key: skip it and keep scanning, since a
                     // real keystroke can arrive in the same read.
@@ -727,26 +745,34 @@ pub fn isUserInput(payload: []const u8) bool {
                     // CSI ? flags u is the terminal's reply to a kitty keyboard status
                     // query, not a key press; skip it and keep scanning the payload
                     const status_reply = csi.final == 'u' and csi.intermediates.len > 0 and csi.intermediates[0] == '?';
-                    if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
+                    if (!status_reply and (csi.final == 'u' or csi.final == '~')) {
+                        decided = true;
+                    }
                     // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
-                    if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
+                    else if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) {
+                        decided = true;
+                    }
                     // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
                     // only intentional keyboard input should trigger leader switch
-                    if (csi.final == 'M' or csi.final == '<') return false;
+                    else if (csi.final == 'M' or csi.final == '<') {
+                        decided = false;
+                    }
                     // focus events: CSI I (focus in) or CSI O (focus out) - EXCLUDE these
                     // these are automatic terminal events, not user typing
-                    if (csi.final == 'I' or csi.final == 'O') return false;
+                    else if (csi.final == 'I' or csi.final == 'O') {
+                        decided = false;
+                    }
                 },
                 .execute => |code| {
                     // looking for CR, LF, tab, and backspace
-                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) return true;
+                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) decided = true;
                 },
                 else => {},
             }
         }
         i += 1;
     }
-    return false;
+    return decided orelse false;
 }
 
 /// Emit the terminal's pwd as OSC 7.
@@ -2153,6 +2179,28 @@ test "isUserInput: key after a reply in the same read still counts" {
     try testing.expect(isUserInput("\x1b[?5ux"));
     try testing.expect(isUserInput("\x1b[?62;22c\x1b[99;5u")); // reply then kitty ctrl+c
     try testing.expect(isUserInput("\x1b[?5u\x1b[3~")); // reply then delete
+}
+
+test "isUserInputContinuing: a reply split across reads is not typing" {
+    var parser = ghostty_vt.Parser.init();
+    // Ghostty's DA1 reply, split as an ssh packet boundary can split it.
+    try testing.expect(!isUserInputContinuing(&parser, "\x1b[?"));
+    try testing.expect(!isUserInputContinuing(&parser, "62;22;52c"));
+    // The stream is back in ground state: real typing still counts.
+    try testing.expect(isUserInputContinuing(&parser, "x"));
+}
+
+test "isUserInputContinuing: split OSC color reply is not typing" {
+    var parser = ghostty_vt.Parser.init();
+    try testing.expect(!isUserInputContinuing(&parser, "\x1b]11;rgb:1e1e/"));
+    try testing.expect(!isUserInputContinuing(&parser, "1e1e/1e1e\x1b\\"));
+    try testing.expect(isUserInputContinuing(&parser, "\r"));
+}
+
+test "isUserInputContinuing: key after a reply tail in the same read counts" {
+    var parser = ghostty_vt.Parser.init();
+    try testing.expect(!isUserInputContinuing(&parser, "\x1b[?62;"));
+    try testing.expect(isUserInputContinuing(&parser, "22;52cq"));
 }
 
 test "isUserInput: bracketed paste included" {
