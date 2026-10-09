@@ -1489,6 +1489,28 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
     }
 }
 
+/// Whether `zmx attach` was typed at the session's own terminal, the only
+/// place a switch is what the caller means.
+///
+/// ZMX_SESSION is inherited by everything the session runs, including
+/// programs that start commands on terminals of their own: an agent that runs
+/// `zmx attach other` from its tool sandbox wants a client on its own
+/// terminal, not to move the person's client. Treating every inherited
+/// ZMX_SESSION as a switch did exactly that (2026-10-09): the leader client of
+/// the agent's session moved to the other session, and input meant for the
+/// agent ran as shell commands there. A terminal belongs to the session when
+/// it is the session's PTY, i.e. the caller is in the session the PTY's shell
+/// leads (forkpty makes the shell a session leader).
+fn callerOwnsSessionTerminal(gpa: std.mem.Allocator, socket_dir: []const u8, current_sesh: []const u8) bool {
+    if (cross.c.isatty(lib_posix.STDIN_FILENO) != 1) return false;
+    const socket_path = socket.getSocketPath(gpa, socket_dir, current_sesh) catch return false;
+    defer gpa.free(socket_path);
+    const probe = ipc.probeSession(gpa, socket_path) catch return false;
+    defer probe.deinit();
+    const sid = cross.c.getsid(0);
+    return sid > 0 and sid == probe.info.pid;
+}
+
 fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh: []const u8) !void {
     // we want daemon.session_name because that's the session name the user provided during zmx attach
     // instead of the name of the session they are currently inside of.
@@ -1571,7 +1593,7 @@ fn parseAttachArgs(argv: []const []const u8) AttachArgs {
 
 fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, env_str: []const u8, labels: ?[]const u8) !void {
     const sesh = socket.getSeshNameFromEnv();
-    if (sesh.len > 0) {
+    if (sesh.len > 0 and callerOwnsSessionTerminal(gpa, daemon.cfg.socket_dir, sesh)) {
         return switchSesh(gpa, io, daemon, sesh);
     }
 

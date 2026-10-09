@@ -17,3 +17,7 @@ Each tarball holds a single `zmx` binary and has a `.sha256` next to it.
 - `fix(attach): don't let terminal query replies claim leadership` — a passive
   viewer's automatic replies (`CSI ? 5 u` etc.) no longer make it the leader and
   resize the session to its window.
+- `fix(attach): switch sessions only from the session's own terminal` — a
+  program that inherits `ZMX_SESSION` and runs `zmx attach other` on a terminal
+  of its own (an agent's tool sandbox) gets its own client instead of moving the
+  session's leader client to `other`.
