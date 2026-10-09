@@ -7,11 +7,13 @@ Use spec: https://common-changelog.org/
 ### Added
 
 - Completions for [`yash`](https://magicant.github.io/yash/)
+- History command now accepts --screen (print only active screen) and --scrollback (num of rows to print)
 
 ### Fixed
 
 - Stop classifying complete kitty keyboard status replies (`CSI ? flags u`) as user input for leader selection
 - Prevent infinite loop in `mkdirAll` when directory path contains a dangling symlink
+- Prevent terminal and kitty keyboard queries from taking leadership control
 
 ## v0.8.1 - 2026-09-05
 
