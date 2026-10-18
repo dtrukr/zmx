@@ -5,6 +5,15 @@
 # the last one. A merge conflict or a failing test stops the run before
 # anything is pushed or published, so hosts keep the previous release.
 #
+# Running sessions keep the daemon binary they were started from, so every
+# release must still talk to daemons started by older ones:
+# - test/compat.bats runs this build's client against daemons started by the
+#   previous release and by v0.8.1-fork.f2df749 (the last legacy-header build).
+# - An upstream commit marked "BREAKING CHANGE" is never merged automatically:
+#   the run fails and opens an issue, and the merge is done by hand together
+#   with whatever keeps old daemons reachable (see `ipc.Wire`). A manual
+#   dispatch with allow_breaking=true overrides this once that work is in.
+#
 # Assets per release: upstream-style `zmx-<version>-<os>-<arch>.tar.gz` (+ .sha256)
 # and version-less copies (`zmx-macos-aarch64.tar.gz`, ...) so installers can
 # use https://github.com/dtrukr/zmx/releases/latest/download/<asset>.
@@ -16,9 +25,15 @@ on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      allow_breaking:
+        description: "Merge upstream commits marked BREAKING CHANGE (only after old daemons are handled)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: fork-release
@@ -46,6 +61,32 @@ jobs:
           before=$(git rev-parse HEAD)
           git merge --no-edit upstream/main
           echo "merged=$([ "$before" != "$(git rev-parse HEAD)" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse breaking upstream changes
+        if: steps.sync.outputs.merged == 'true' && inputs.allow_breaking != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          breaking=""
+          for c in $(git rev-list --no-merges "${{ steps.sync.outputs.before }}..HEAD"); do
+            if git show -s --format=%B "$c" | grep -qE '^BREAKING[ -]CHANGE'; then
+              breaking="$breaking$(git show -s --format='%h %s' "$c")"$'\n'
+            fi
+          done
+          breaking="${breaking%$'\n'}"
+          [ -z "$breaking" ] && exit 0
+          title="Upstream zmx has a breaking change: merge by hand"
+          body=$(printf '%s\n\n%s\n%s\n\n%s\n%s\n' \
+            "The daily fork-release run stopped before merging. Running zmx daemons keep their old binary, so a client that cannot talk to them blanks every restored pane." \
+            "Breaking commits (upstream/main):" "$(echo "$breaking" | sed 's/^/- /')" \
+            "Merge them by hand with whatever keeps old daemons reachable, check test/compat.bats against the previous release," \
+            "then rerun this workflow with allow_breaking=true or push the merge.")
+          if ! gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number -q '.[0].number' | grep -q .; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          echo "::error::upstream breaking change, not merging: $breaking"
+          exit 1
 
       - name: Install zig and bats
         run: |
@@ -60,6 +101,23 @@ jobs:
 
       - name: Unit tests
         run: zig build test
+
+      - name: Fetch old releases for compat tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release hosts are running now, plus the last legacy-header build.
+          prev=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          bins=""
+          for tag in $(printf '%s\n' "$prev" v0.8.1-fork.f2df749 | sort -u); do
+            dir="/tmp/zmx-old/$tag"
+            mkdir -p "$dir"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'zmx-linux-x86_64.tar.gz' --dir "$dir"
+            tar -xzf "$dir/zmx-linux-x86_64.tar.gz" -C "$dir"
+            bins="$bins $dir/zmx"
+          done
+          echo "ZMX_OLD_BINS=${bins# }" >> "$GITHUB_ENV"
 
       - name: Integration tests
         run: |

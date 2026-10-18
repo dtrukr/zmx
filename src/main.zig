@@ -444,7 +444,7 @@ pub fn main(init: std.process.Init) !void {
                 error.NameTooLong => return socket.printSessionNameTooLong(init.io, session_name, cfg.socket_dir),
                 error.OutOfMemory => return err,
             };
-            const client_sock = socket.sessionConnect(socket_path) catch |err| {
+            const client_sock = ipc.connectSession(socket_path) catch |err| {
                 return printError(io, "cannot connect to session \"{s}\": {s}", .{ session_name, @errorName(err) });
             };
             try client_socket_fds.append(gpa, client_sock);
@@ -1481,7 +1481,8 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
         var request = std.mem.zeroes(ipc.Capture);
         request.format = @intFromEnum(format);
         request.rows = rows;
-        ipc.send(fd, .Capture, std.mem.asBytes(&request)) catch |err| switch (err) {
+        var request_buf: [@sizeOf(ipc.Capture)]u8 = undefined;
+        ipc.send(fd, .Capture, ipc.captureBytes(fd, request, &request_buf)) catch |err| switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => return,
             else => return err,
         };
@@ -1644,7 +1645,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, env_str: []const 
         try labelSet(gpa, io, daemon.cfg, daemon.session_name, kvs);
     }
 
-    const client_sock = socket.sessionConnect(daemon.socket_path) catch |err| {
+    const client_sock = ipc.connectSession(daemon.socket_path) catch |err| {
         return printError(io, "cannot connect to session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
     };
     std.log.info("attached session={s}", .{daemon.session_name});

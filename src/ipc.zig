@@ -98,6 +98,85 @@ pub fn getTerminalSize(fd: i32) Resize {
 }
 
 pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+
+/// Header layout a connection speaks. `v1` is the frozen protocol above.
+/// `legacy` is what daemons started by a zmx built before the freeze
+/// (35b8783) speak: `packed struct { tag: u8, len: u32 }`, so the length
+/// sits in bytes 1-4 and bytes 5-7 are padding. Daemons always speak `v1`;
+/// only a client talking to a session started by an older zmx uses
+/// `legacy`, so upgrading the binary doesn't strand running sessions.
+/// The payloads are byte-identical in both layouts except `Capture`
+/// (see `captureBytes`); `Info` was 552 bytes before the freeze too.
+pub const Wire = enum { v1, legacy };
+
+const LEGACY_INFO_LEN: u32 = @sizeOf(Info);
+
+/// Client fds connected to a legacy daemon. `connectSession` sets or
+/// clears the entry for every fd it returns, so a reused fd number never
+/// inherits a stale mark.
+var legacy_fds: [64]i32 = [_]i32{-1} ** 64;
+
+pub fn wireFor(fd: i32) Wire {
+    for (legacy_fds) |l| if (l == fd) return .legacy;
+    return .v1;
+}
+
+/// Daemons call this for every accepted fd: a daemon forked from a client
+/// process must not inherit that client's marks on a reused fd number.
+pub fn forgetWire(fd: i32) void {
+    setWire(fd, .v1);
+}
+
+fn setWire(fd: i32, wire: Wire) void {
+    for (&legacy_fds) |*l| if (l.* == fd) {
+        l.* = -1;
+    };
+    if (wire == .v1) return;
+    for (&legacy_fds) |*l| if (l.* == -1) {
+        l.* = fd;
+        return;
+    };
+}
+
+fn encodeHeader(wire: Wire, tag: Tag, len: u32) [8]u8 {
+    switch (wire) {
+        .v1 => return std.mem.toBytes(Header{ .tag = tag, .len = len }),
+        .legacy => {
+            var out = [_]u8{0} ** 8;
+            out[0] = @intFromEnum(tag);
+            std.mem.writeInt(u32, out[1..5], len, .little);
+            return out;
+        },
+    }
+}
+
+fn decodeHeader(wire: Wire, bytes: []const u8) ?Header {
+    switch (wire) {
+        .v1 => {
+            const hdr = std.mem.bytesToValue(Header, bytes[0..@sizeOf(Header)]);
+            if (hdr.protocol_version != PROTOCOL_VERSION) return null;
+            return hdr;
+        },
+        .legacy => return .{
+            .tag = @enumFromInt(bytes[0]),
+            .len = std.mem.readInt(u32, bytes[1..5], .little),
+        },
+    }
+}
+
+/// `Capture` request bytes for `fd`'s wire. Legacy daemons used
+/// `packed struct { format: u8, rows: u32 }`: rows in bytes 1-4.
+pub fn captureBytes(fd: i32, request: Capture, out: *[@sizeOf(Capture)]u8) []const u8 {
+    switch (wireFor(fd)) {
+        .v1 => out.* = std.mem.toBytes(request),
+        .legacy => {
+            out.* = [_]u8{0} ** @sizeOf(Capture);
+            out[0] = request.format;
+            std.mem.writeInt(u32, out[1..5], request.rows, .little);
+        },
+    }
+    return out;
+}
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 
@@ -119,12 +198,8 @@ pub const Info = extern struct {
 };
 
 pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
-    const header = Header{
-        .tag = tag,
-        .len = @intCast(data.len),
-    };
-    const header_bytes = std.mem.asBytes(&header);
-    try writeAll(fd, header_bytes);
+    const header_bytes = encodeHeader(wireFor(fd), tag, @intCast(data.len));
+    try writeAll(fd, &header_bytes);
     if (data.len > 0) {
         try writeAll(fd, data);
     }
@@ -136,14 +211,21 @@ pub fn appendMessage(
     tag: Tag,
     data: []const u8,
 ) !void {
-    const header = Header{
-        .tag = tag,
-        .len = @intCast(data.len),
-    };
+    return appendMessageWire(gpa, list, .v1, tag, data);
+}
+
+pub fn appendMessageWire(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    wire: Wire,
+    tag: Tag,
+    data: []const u8,
+) !void {
+    const header = encodeHeader(wire, tag, @intCast(data.len));
     // Guarantee capacity for header + payload in one check to avoid
     // intermediate realloc between the two appends on the hot path.
     try list.ensureTotalCapacity(gpa, list.items.len + @sizeOf(Header) + data.len);
-    list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+    list.appendSliceAssumeCapacity(&header);
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
@@ -178,6 +260,8 @@ pub const SocketBuffer = struct {
     buf: std.ArrayList(u8),
     alloc: std.mem.Allocator,
     head: usize,
+    /// Set from the fd on every `read`; daemon-side fds are always `v1`.
+    wire: Wire = .v1,
 
     pub fn init(alloc: std.mem.Allocator) !SocketBuffer {
         return .{
@@ -207,6 +291,7 @@ pub const SocketBuffer = struct {
             self.head = 0;
         }
 
+        self.wire = wireFor(fd);
         var tmp: [4096]u8 = undefined;
         const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
@@ -222,14 +307,15 @@ pub const SocketBuffer = struct {
         const available = self.buf.items[self.head..];
         if (available.len < @sizeOf(Header)) return null;
 
-        const hdr = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
-        if (hdr.len > MAX_PAYLOAD_LEN or hdr.protocol_version != PROTOCOL_VERSION) {
+        const decoded = decodeHeader(self.wire, available[0..@sizeOf(Header)]);
+        if (decoded == null or decoded.?.len > MAX_PAYLOAD_LEN) {
             // framing error / corrupted stream: clear buffer to avoid
             // infinite alloc
             self.buf.clearRetainingCapacity();
             self.head = 0;
             return null;
         }
+        const hdr = decoded.?;
 
         const total = @sizeOf(Header) + @as(usize, hdr.len);
         if (available.len < total) return null;
@@ -245,13 +331,79 @@ const ConnectError = error{
     Unexpected,
 };
 
-/// Connect-only liveness check. Callers that don't read `Info` should use
-/// this (not `probeSession`) so they survive `Info` shape changes.
-pub fn connectSession(socket_path: []const u8) ConnectError!i32 {
+/// Connect-only liveness check: no wire detection, no messages sent.
+pub fn connectOnly(socket_path: []const u8) ConnectError!i32 {
     return socket.sessionConnect(socket_path) catch |err| switch (err) {
         error.ConnectionRefused => return error.ConnectionRefused,
         else => return error.Unexpected,
     };
+}
+
+/// Connects a client to a session, speaking whichever header layout its
+/// daemon understands (see `Wire`). Callers that don't read `Info` should
+/// use this (not `probeSession`) so they survive `Info` shape changes.
+pub fn connectSession(socket_path: []const u8) ConnectError!i32 {
+    const wire = detectWire(socket_path);
+    const fd = try connectOnly(socket_path);
+    setWire(fd, wire);
+    return fd;
+}
+
+/// Which header layout the daemon behind `socket_path` speaks, decided on
+/// a throwaway connection. The probe is a v1 `Info` header followed by one
+/// zero byte. A v1 daemon reads an empty `Info` request (the extra byte is
+/// an incomplete frame, dropped when we hang up). A legacy daemon reads
+/// bytes 1-4 (`01 00 00 00`) as length 1 and the extra byte as the payload,
+/// which `Info` ignores. Both answer with a 552-byte `Info` in their own
+/// layout; whichever layout frames the reply stream cleanly up to that
+/// `Info` wins. Anything inconclusive returns `v1`, the pre-fallback
+/// behavior.
+fn detectWire(socket_path: []const u8) Wire {
+    const fd = connectOnly(socket_path) catch return .v1;
+    defer lib_posix.close(fd);
+
+    const probe = encodeHeader(.v1, .Info, 0) ++ [_]u8{0};
+    writeAll(fd, &probe) catch return .v1;
+
+    var buf: [16 * 1024]u8 = undefined;
+    var len: usize = 0;
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    var waited_ms: i32 = 0;
+    while (waited_ms < 1000 and len < buf.len) : (waited_ms += 50) {
+        const ready = lib_posix.poll(&poll_fds, 50) catch return .v1;
+        if (ready == 0) continue;
+        const n = lib_posix.read(fd, buf[len..]) catch return .v1;
+        if (n == 0) break;
+        len += n;
+        if (classify(buf[0..len])) |wire| return wire;
+    }
+    return .v1;
+}
+
+const Scan = enum { found, more, invalid };
+
+/// Walks `bytes` as a stream of `wire` frames looking for the `Info` reply.
+/// Output a daemon broadcasts to every client can arrive ahead of it.
+fn scanFor(wire: Wire, bytes: []const u8) Scan {
+    var off: usize = 0;
+    while (bytes.len - off >= @sizeOf(Header)) {
+        const hdr = decodeHeader(wire, bytes[off..][0..@sizeOf(Header)]) orelse return .invalid;
+        if (hdr.len > MAX_PAYLOAD_LEN) return .invalid;
+        if (wire == .v1 and hdr._reserved != 0) return .invalid;
+        if (hdr.tag == .Info) return if (hdr.len == LEGACY_INFO_LEN) .found else .invalid;
+        off += @sizeOf(Header) + @as(usize, hdr.len);
+        if (off > bytes.len) return .more;
+    }
+    return .more;
+}
+
+fn classify(bytes: []const u8) ?Wire {
+    const v1 = scanFor(.v1, bytes);
+    if (v1 == .found) return .v1;
+    const legacy = scanFor(.legacy, bytes);
+    if (legacy == .found) return .legacy;
+    if (v1 == .invalid and legacy == .invalid) return .v1;
+    return null;
 }
 
 const SessionProbeError = error{
@@ -390,6 +542,49 @@ pub fn roundTripForTag(
         }
     }
     return error.Unexpected;
+}
+
+test "legacy header puts the length in bytes 1-4" {
+    const hdr = encodeHeader(.legacy, .Info, 552);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 0x28, 0x02, 0, 0, 0, 0, 0 }, &hdr);
+    const back = decodeHeader(.legacy, &hdr).?;
+    try std.testing.expectEqual(Tag.Info, back.tag);
+    try std.testing.expectEqual(@as(u32, 552), back.len);
+}
+
+test "probe is an empty Info to v1 and a 1-byte Info to legacy" {
+    const probe = encodeHeader(.v1, .Info, 0) ++ [_]u8{0};
+    const as_v1 = decodeHeader(.v1, probe[0..8]).?;
+    try std.testing.expectEqual(@as(u32, 0), as_v1.len);
+    const as_legacy = decodeHeader(.legacy, probe[0..8]).?;
+    try std.testing.expectEqual(Tag.Info, as_legacy.tag);
+    try std.testing.expectEqual(@as(u32, 1), as_legacy.len);
+}
+
+test "classify tells v1 and legacy Info replies apart behind output" {
+    const alloc = std.testing.allocator;
+    const payload = [_]u8{0} ** 552;
+    inline for (.{ Wire.v1, Wire.legacy }) |wire| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(alloc);
+        try appendMessageWire(alloc, &list, wire, .Output, "x");
+        try appendMessageWire(alloc, &list, wire, .Output, "hello world");
+        try appendMessageWire(alloc, &list, wire, .Info, &payload);
+        try std.testing.expectEqual(@as(?Wire, wire), classify(list.items));
+        // A partial reply is not decided yet.
+        try std.testing.expectEqual(@as(?Wire, null), classify(list.items[0..20]));
+    }
+}
+
+test "SocketBuffer decodes legacy frames" {
+    const alloc = std.testing.allocator;
+    var sb = try SocketBuffer.init(alloc);
+    defer sb.deinit();
+    sb.wire = .legacy;
+    try appendMessageWire(alloc, &sb.buf, .legacy, .History, "abc");
+    const msg = sb.next().?;
+    try std.testing.expectEqual(Tag.History, msg.header.tag);
+    try std.testing.expectEqualSlices(u8, "abc", msg.payload);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

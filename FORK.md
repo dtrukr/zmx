@@ -21,3 +21,18 @@ Each tarball holds a single `zmx` binary and has a `.sha256` next to it.
   program that inherits `ZMX_SESSION` and runs `zmx attach other` on a terminal
   of its own (an agent's tool sandbox) gets its own client instead of moving the
   session's leader client to `other`.
+- `fix(ipc): keep talking to daemons started before the wire freeze` — upstream
+  35b8783 moved the IPC header length from bytes 1-4 to 4-7 and marked it
+  "existing daemons must be killed". A daemon keeps the binary it was started
+  from, so after an upgrade every running session answered `err=Unexpected` and
+  re-attached panes stayed blank. `ipc.connectSession` now probes each daemon
+  once and speaks the legacy header to old ones (`ipc.Wire`);
+  `test/compat.bats` covers it against older releases in CI.
+
+## Release gates
+
+`fork-release.yml` never auto-merges an upstream commit marked
+`BREAKING CHANGE`: it fails and opens an issue so the merge is done by hand
+with whatever keeps old daemons reachable. Every release also runs
+`test/compat.bats` against daemons started by the previous release and by
+`v0.8.1-fork.f2df749`.

@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
+    const wire = ipc.wireFor(client_sock_fd);
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .Debug) {
             const GPA = std.heap.DebugAllocator(.{});
@@ -42,12 +43,12 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
     defer sock_write_buf.deinit(gpa);
 
     if (env_str.len > 0) {
-        try ipc.appendMessage(gpa, &sock_write_buf, .EnvSet, env_str);
+        try ipc.appendMessageWire(gpa, &sock_write_buf, wire, .EnvSet, env_str);
     }
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    try ipc.appendMessage(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    try ipc.appendMessageWire(gpa, &sock_write_buf, wire, .Init, std.mem.asBytes(&size));
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
@@ -104,9 +105,10 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-            try ipc.appendMessage(
+            try ipc.appendMessageWire(
                 gpa,
                 &sock_write_buf,
+                wire,
                 .Resize,
                 std.mem.asBytes(&next_size),
             );
@@ -126,9 +128,9 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                     // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
                     if (!detach_key_disabled and util.isCtrlBackslash(buf[0..n])) {
                         std.log.info("detach key detected", .{});
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
+                        try ipc.appendMessageWire(gpa, &sock_write_buf, wire, .Detach, "");
                     } else {
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Input, buf[0..n]);
+                        try ipc.appendMessageWire(gpa, &sock_write_buf, wire, .Input, buf[0..n]);
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -165,9 +167,10 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-                        try ipc.appendMessage(
+                        try ipc.appendMessageWire(
                             gpa,
                             &sock_write_buf,
+                            wire,
                             .Resize,
                             std.mem.asBytes(&next_size),
                         );
@@ -320,6 +323,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 null,
                 lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC,
             );
+            ipc.forgetWire(client_fd);
             const client = try gpa.create(Client);
             client.* = Client{
                 .alloc = gpa,
@@ -728,7 +732,7 @@ pub const Daemon = struct {
         var should_create = !exists;
 
         if (exists) {
-            if (ipc.connectSession(self.socket_path)) |fd| {
+            if (ipc.connectOnly(self.socket_path)) |fd| {
                 lib_posix.close(fd);
                 if (self.command != null) {
                     std.log.warn(
