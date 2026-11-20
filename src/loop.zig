@@ -242,7 +242,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
 
     try signal.openSignalPipe();
-    signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
+    for (signal.daemon_guarded_signals) |sig| signal.installReportingHandler(sig);
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 8);
     defer poll_fds.deinit(gpa);
 
@@ -305,12 +305,24 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         _ = try lib_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
-            signal.drainSignalPipe();
-            std.log.info(
-                "SIGTERM received, shutting down gracefully session={s}",
-                .{daemon.session_name},
-            );
-            break :daemon_loop;
+            var stop = false;
+            while (signal.readSignalEvent()) |event| {
+                if (signal.daemonShouldStop(event)) {
+                    std.log.info(
+                        "SIGTERM from pid 1 (system shutdown), shutting down gracefully session={s}",
+                        .{daemon.session_name},
+                    );
+                    stop = true;
+                } else {
+                    // A stray pkill/killall must not take the session (and
+                    // the agent in it) down. Only `zmx kill` ends a session.
+                    std.log.warn(
+                        "ignored signal {d} from pid={d} uid={d}; use `zmx kill` to end the session session={s}",
+                        .{ event.sig, event.pid, event.uid, daemon.session_name },
+                    );
+                }
+            }
+            if (stop) break :daemon_loop;
         }
 
         if (poll_fds.items[0].revents & (lib_posix.POLL.ERR | lib_posix.POLL.HUP | lib_posix.POLL.NVAL) != 0) {
