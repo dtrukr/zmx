@@ -30,6 +30,10 @@ on:
         description: "Merge upstream commits marked BREAKING CHANGE (only after old daemons are handled)"
         type: boolean
         default: false
+      skip_upstream:
+        description: "Release main as it is, without merging upstream (for a fix that must ship while the upstream merge is blocked)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -56,6 +60,12 @@ jobs:
         run: |
           git config user.name "zmx-fork-bot"
           git config user.email "zmx-fork-bot@users.noreply.github.com"
+          if [ "${{ inputs.skip_upstream }}" = "true" ]; then
+            echo "skip_upstream: releasing main without merging upstream"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            echo "before=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git remote add upstream https://github.com/neurosnap/zmx.git
           git fetch --no-tags upstream main
           before=$(git rev-parse HEAD)
