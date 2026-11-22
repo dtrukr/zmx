@@ -7,22 +7,36 @@ const lib_posix = @import("posix.zig");
 /// never surfaces; the handler writes a byte here and poll() wakes on POLLIN.
 pub var sig_pipe: [2]lib_posix.fd_t = .{ -1, -1 };
 
-pub fn wakeSignalPipe(_: lib_posix.SIG, _: *const lib_posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+pub fn wakeSignalPipe(sig: lib_posix.SIG, _: *const lib_posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     const saved = std.c._errno().*;
-    _ = std.c.write(sig_pipe[1], "x", 1);
+    const byte = [_]u8{@intCast(@backingInt(sig))};
+    _ = std.c.write(sig_pipe[1], &byte, 1);
     std.c._errno().* = saved;
 }
 
 // std.posix.poll retries EINTR internally, so SA_RESTART is moot -- neither
 // setting wakes the loop. The handler writes to sig_pipe instead; poll()
 // wakes on its read end.
-pub fn installWakeHandler(sig: u6) void {
+/// Restores how the caller handled this signal before the client loop began.
+pub const WakeHandler = struct {
+    sig: lib_posix.SIG,
+    previous: lib_posix.Sigaction,
+
+    pub fn restore(self: WakeHandler) void {
+        lib_posix.sigaction(self.sig, &self.previous, null);
+    }
+};
+
+pub fn installWakeHandler(sig: u6) WakeHandler {
     const act: lib_posix.Sigaction = .{
         .handler = .{ .sigaction = wakeSignalPipe },
         .mask = lib_posix.sigemptyset(),
         .flags = lib_posix.SA.SIGINFO,
     };
-    lib_posix.sigaction(@as(lib_posix.SIG, @enumFromInt(sig)), &act, null);
+    const native_sig: lib_posix.SIG = @fromBackingInt(@intCast(sig));
+    var previous: lib_posix.Sigaction = undefined;
+    lib_posix.sigaction(native_sig, &act, &previous);
+    return .{ .sig = native_sig, .previous = previous };
 }
 
 pub fn ignoreSigpipe() void {
@@ -38,11 +52,26 @@ pub fn openSignalPipe() !void {
     sig_pipe = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
 }
 
-pub fn drainSignalPipe() void {
+pub fn closeSignalPipe() void {
+    const fds = sig_pipe;
+    sig_pipe = .{ -1, -1 };
+    lib_posix.close(fds[0]);
+    lib_posix.close(fds[1]);
+}
+
+pub fn drainSignalPipe() error{ Sighup, Sigint, Sigterm }!void {
     var b: [16]u8 = undefined;
     while (true) {
         const n = lib_posix.read(sig_pipe[0], &b) catch return;
         if (n == 0) return;
+        for (b[0..n]) |sig| {
+            switch (sig) {
+                @backingInt(lib_posix.SIG.HUP) => return error.Sighup,
+                @backingInt(lib_posix.SIG.INT) => return error.Sigint,
+                @backingInt(lib_posix.SIG.TERM) => return error.Sigterm,
+                else => {},
+            }
+        }
     }
 }
 
@@ -64,7 +93,7 @@ fn senderOf(info: *const lib_posix.siginfo_t) struct { pid: i32, uid: u32 } {
 pub fn reportSignalPipe(sig: lib_posix.SIG, info: *const lib_posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     const saved = std.c._errno().*;
     const sender = senderOf(info);
-    const event = Event{ .sig = @intCast(@intFromEnum(sig)), .pid = sender.pid, .uid = sender.uid };
+    const event = Event{ .sig = @intCast(@backingInt(sig)), .pid = sender.pid, .uid = sender.uid };
     // Smaller than PIPE_BUF, so the write is atomic and records never interleave.
     _ = std.c.write(sig_pipe[1], @ptrCast(&event), @sizeOf(Event));
     std.c._errno().* = saved;
@@ -106,13 +135,28 @@ pub const daemon_guarded_signals = [_]lib_posix.SIG{
 
 /// Whether a signal the daemon received should shut the session down.
 pub fn daemonShouldStop(event: Event) bool {
-    return event.sig == @as(i32, @intCast(@intFromEnum(lib_posix.SIG.TERM))) and event.pid == 1;
+    return event.sig == @as(i32, @intCast(@backingInt(lib_posix.SIG.TERM))) and event.pid == 1;
 }
 
 test "daemon stops only on SIGTERM from pid 1" {
-    const term: i32 = @intCast(@intFromEnum(lib_posix.SIG.TERM));
-    const hup: i32 = @intCast(@intFromEnum(lib_posix.SIG.HUP));
+    const term: i32 = @intCast(@backingInt(lib_posix.SIG.TERM));
+    const hup: i32 = @intCast(@backingInt(lib_posix.SIG.HUP));
     try std.testing.expect(daemonShouldStop(.{ .sig = term, .pid = 1, .uid = 0 }));
     try std.testing.expect(!daemonShouldStop(.{ .sig = term, .pid = 4242, .uid = 501 }));
     try std.testing.expect(!daemonShouldStop(.{ .sig = hup, .pid = 1, .uid = 0 }));
+}
+
+pub fn reraise(sig: lib_posix.SIG) noreturn {
+    const act: lib_posix.Sigaction = .{
+        .handler = .{ .handler = lib_posix.SIG.DFL },
+        .mask = lib_posix.sigemptyset(),
+        .flags = 0,
+    };
+    lib_posix.sigaction(sig, &act, null);
+
+    var mask = lib_posix.sigemptyset();
+    std.posix.sigaddset(&mask, sig);
+    std.posix.sigprocmask(lib_posix.SIG.UNBLOCK, &mask, null);
+    std.posix.raise(sig) catch {};
+    std.process.exit(128 + @as(u8, @intCast(@backingInt(sig))));
 }

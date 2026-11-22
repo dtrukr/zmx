@@ -1,9 +1,8 @@
 const std = @import("std");
-const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
-const cross = @import("cross.zig");
+const cross = @import("cross");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
@@ -12,6 +11,8 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const terminal = @import("terminal.zig");
+const ghostty_vt = terminal.ghostty_vt;
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -19,7 +20,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const wire = ipc.wireFor(client_sock_fd);
     const gpa: std.mem.Allocator = blk: {
-        if (builtin.mode == .Debug) {
+        if (builtin.mode == .debug) {
             const GPA = std.heap.DebugAllocator(.{});
             const Static = struct {
                 var gpa: GPA = .{};
@@ -31,7 +32,18 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
     defer lib_posix.close(client_sock_fd);
 
     try signal.openSignalPipe();
-    signal.installWakeHandler(@intFromEnum(lib_posix.SIG.WINCH));
+    defer signal.closeSignalPipe();
+    const handlers = [_]signal.WakeHandler{
+        signal.installWakeHandler(@backingInt(lib_posix.SIG.WINCH)),
+        signal.installWakeHandler(@backingInt(lib_posix.SIG.TERM)),
+        signal.installWakeHandler(@backingInt(lib_posix.SIG.HUP)),
+        signal.installWakeHandler(@backingInt(lib_posix.SIG.INT)),
+    };
+    // Restore the caller's handlers before closing their wake pipe. Otherwise
+    // Ctrl C (SIGINT), SIGTERM, and SIGHUP would reach handlers that can no
+    // longer wake the client. These signals could not stop it while its
+    // terminal is being attached to another session.
+    defer for (handlers) |handler| handler.restore();
 
     // Make socket non-blocking to avoid blocking on writes
     var sock_flags = try lib_posix.fcntl(client_sock_fd, lib_posix.F.GETFL, 0);
@@ -103,7 +115,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
         _ = try lib_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
-            signal.drainSignalPipe();
+            try signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
             try ipc.appendMessageWire(
                 gpa,
@@ -523,7 +535,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         _ => {
                             std.log.warn(
                                 "ignoring unknown IPC tag={d}",
-                                .{@intFromEnum(msg.header.tag)},
+                                .{@backingInt(msg.header.tag)},
                             );
                             ipc.appendMessage(gpa, &client.write_buf, .Unsupported, "") catch {};
                             client.has_pending_output = true;
@@ -646,6 +658,7 @@ pub const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    quiet: bool = false,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -667,7 +680,6 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
-        gpa.free(self.socket_path);
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -780,7 +792,7 @@ pub const Daemon = struct {
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
-        const log_fd = log.log_system.file.?.handle;
+        const log_fd = if (log.log_system.file) |f| f.handle else -1;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
@@ -809,10 +821,12 @@ pub const Daemon = struct {
             switch (err) {
                 error.IsClientProc => {
                     // send a msg to the client that the session was created.
-                    var w_buf: [2048]u8 = undefined;
-                    var w = std.Io.File.stdout().writer(io, &w_buf);
-                    try w.interface.print("session \"{s}\" created\n", .{sesh_name});
-                    try w.interface.flush();
+                    if (!self.quiet) {
+                        var w_buf: [2048]u8 = undefined;
+                        var w = std.Io.File.stdout().writer(io, &w_buf);
+                        try w.interface.print("session \"{s}\" created\n", .{sesh_name});
+                        try w.interface.flush();
+                    }
                     lib_posix.close(server_sock_fd);
                     return false;
                 },
@@ -855,7 +869,7 @@ pub const Daemon = struct {
         }
 
         const gpa: std.mem.Allocator = blk: {
-            if (builtin.mode == .Debug) {
+            if (builtin.mode == .debug) {
                 const GPA = std.heap.DebugAllocator(.{});
                 const Static = struct {
                     var gpa: GPA = .{};
@@ -939,7 +953,7 @@ pub const Daemon = struct {
         // Every read goes through the client's parser, the leader's too, so
         // its state stays true to the stream if this client stops leading.
         if (client.input_parser == null) client.input_parser = ghostty_vt.Parser.init();
-        const user_input = util.isUserInputContinuing(&client.input_parser.?, payload);
+        const user_input = terminal.isUserInputContinuing(&client.input_parser.?, payload);
 
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
@@ -1050,7 +1064,7 @@ pub const Daemon = struct {
         // only resize if leader
         if (is_leader) {
             var ws = resize.winsize();
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            _ = cross.ioctl(pty_fd, cross.TIOCSWINSZ, &ws);
 
             // On re-attach, deliver SIGWINCH to the foreground process group so
             // incremental renderers (Ink, Claude Code, etc.) know to repaint.
@@ -1058,7 +1072,7 @@ pub const Daemon = struct {
             // was unchanged, the kernel suppressed it, so signal the pgrp explicitly.
             if (self.has_pty_output) {
                 var pgrp: lib_posix.pid_t = 0;
-                if (cross.c.ioctl(pty_fd, cross.c.TIOCGPGRP, &pgrp) == 0 and pgrp > 0) {
+                if (cross.ioctl(pty_fd, cross.TIOCGPGRP, &pgrp) == 0 and pgrp > 0) {
                     lib_posix.kill(-pgrp, .WINCH) catch {};
                 }
             }
@@ -1084,7 +1098,7 @@ pub const Daemon = struct {
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         var ws = resize.winsize();
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        _ = cross.ioctl(pty_fd, cross.TIOCSWINSZ, &ws);
         try resizeTerm(gpa, term, resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1180,7 +1194,7 @@ pub const Daemon = struct {
     ) !void {
         self.setPwd(term);
         const format: util.HistoryFormat = if (payload.len > 0)
-            @enumFromInt(payload[0])
+            @fromBackingInt(@intCast(payload[0]))
         else
             .plain;
         if (util.serializeTerminal(gpa, term, format)) |output| {
@@ -1320,6 +1334,9 @@ pub const Daemon = struct {
         // Chunk large files to stay under command-line length limits.
         // 48000 is divisible by 3 (clean base64 boundaries) and encodes
         // to ~64KB, well under typical ARG_MAX.
+        // The commands skip queuePtyInput's cap: it would drop the chunks
+        // past PTY_WRITE_BUF_MAX and leave the file cut short. The payload
+        // is already bounded by ipc.MAX_PAYLOAD_LEN.
         const chunk_size = 48000;
         var offset: usize = 0;
         var is_first = true;
@@ -1333,16 +1350,16 @@ pub const Daemon = struct {
             defer gpa.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            self.queuePtyInput(gpa, "printf '%s' '");
-            self.queuePtyInput(gpa, encoded);
+            try self.pty_write_buf.appendSlice(gpa, "printf '%s' '");
+            try self.pty_write_buf.appendSlice(gpa, encoded);
             if (is_first) {
-                self.queuePtyInput(gpa, "' | base64 -d > '");
+                try self.pty_write_buf.appendSlice(gpa, "' | base64 -d > '");
             } else {
-                self.queuePtyInput(gpa, "' | base64 -d >> '");
+                try self.pty_write_buf.appendSlice(gpa, "' | base64 -d >> '");
             }
-            self.queuePtyInput(gpa, file_path);
-            self.queuePtyInput(gpa, "'");
-            self.queuePtyInput(gpa, "\r");
+            try self.pty_write_buf.appendSlice(gpa, file_path);
+            try self.pty_write_buf.appendSlice(gpa, "'");
+            try self.pty_write_buf.appendSlice(gpa, "\r");
 
             offset = end;
             is_first = false;
@@ -1419,6 +1436,47 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 };
+
+test "client loop restores prior signal handlers after the server connection closes" {
+    const signals = [_]lib_posix.SIG{ .WINCH, .TERM, .HUP, .INT };
+    var previous: [signals.len]lib_posix.Sigaction = undefined;
+    const ignored: lib_posix.Sigaction = .{
+        .handler = .{ .handler = lib_posix.SIG.IGN },
+        .mask = lib_posix.sigemptyset(),
+        .flags = 0,
+    };
+    for (signals, &previous) |sig, *action| {
+        lib_posix.sigaction(sig, &ignored, action);
+    }
+    defer for (signals, &previous) |sig, *action| {
+        lib_posix.sigaction(sig, action, null);
+    };
+
+    // Closing the peer makes the real client loop finish without a timer or
+    // another process. It still installs and removes all its signal handlers.
+    var sockets: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets));
+    lib_posix.close(sockets[1]);
+    const result = try clientLoop(sockets[0], "");
+    try std.testing.expectEqual(.detach, result.kind);
+    try std.testing.expectEqual(@as(i32, -1), signal.sig_pipe[0]);
+    try std.testing.expectEqual(@as(i32, -1), signal.sig_pipe[1]);
+    for (signals) |sig| {
+        var action: lib_posix.Sigaction = undefined;
+        lib_posix.sigaction(sig, null, &action);
+        try std.testing.expectEqual(lib_posix.SIG.IGN, action.handler.handler);
+    }
+}
+
+test "daemon deinit leaves the caller-owned socket path intact" {
+    var cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var socket_path = "/tmp/zmx-test/socket".*;
+    var daemon = Daemon.init(std.testing.io, &cfg, "test", &socket_path);
+
+    daemon.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/tmp/zmx-test/socket", &socket_path);
+}
 
 test "terminal retains the configured scrollback without the default byte cap" {
     const alloc = std.testing.allocator;
